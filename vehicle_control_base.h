@@ -202,7 +202,8 @@ public:
 
         // 更新纵向速度
         vx += a * dt;
-        vx = std::max(std::min(vx, 25.0), 1.0);  // 更宽松的速度范围
+        vx = std::max(std::min(vx, 25.0), 0.0);  // 更宽松的速度范围
+        x += vx * dt;
     }
 
     /**
@@ -278,14 +279,6 @@ public:
 /**
  * 生成平滑的S型周期轨迹，考虑车辆动力学约束
  */
- /**
-  * ReferenceTrajectoryGenerator - 简化版
-  * 生成满足车辆动力学约束的S型参考轨迹
-  */
-  /**
-   * ReferenceTrajectoryGenerator - 简化版
-   * 生成满足车辆动力学约束的S型参考轨迹
-   */
 class ReferenceTrajectoryGenerator {
 private:
     // 轨迹参数
@@ -298,6 +291,10 @@ private:
     double max_steering_angle;   // 最大转向角
     double max_lateral_accel;    // 最大横向加速度
     double max_steering_rate;    // 最大转向角速率
+
+    // 加速过程模拟用PID和车辆模型
+    const PID* speed_pid_ptr;     // 速度PID控制器指针
+    const Vehicle* vehicle_template_ptr; // 车辆模板指针
 
     bool trajectory_generated;
 
@@ -324,6 +321,8 @@ public:
      * @param max_delta_rate 最大转向角速率
      */
     ReferenceTrajectoryGenerator(
+        const PID& speed_pid,          // 速度PID控制器
+        const Vehicle& vehicle_template, // 车辆模板
         double max_offset = 0.5,    // 最大横向偏移
         double period = 200.0,      // 轨迹周期长度
         double smoothness = 5.0,    // 平滑度因子
@@ -331,7 +330,9 @@ public:
         double max_accel = 2.0,     // 最大横向加速度
         double max_delta = 0.5,     // 最大转向角(rad)
         double max_delta_rate = 0.1 // 最大转向角速率(rad/s)
-    ) : max_lateral_offset(max_offset),
+    ) : speed_pid_ptr(&speed_pid),
+        vehicle_template_ptr(&vehicle_template),
+        max_lateral_offset(max_offset),
         path_period(period),
         smoothness_factor(smoothness),
         vehicle_wheelbase(wheelbase),
@@ -342,10 +343,45 @@ public:
     }
 
     /**
- * 根据索引获取参考点
- * @param index 轨迹点索引
- * @return 对应索引的参考点
+ * 模拟车辆从当前速度加速到目标速度的过程
+ * @param target_speed 目标速度
+ * @param duration 模拟时长
+ * @param dt 时间步长
+ * @return 预测的车辆x位置序列
  */
+    vector<double> simulateAcceleration(double target_speed, double duration, double dt) const {
+        // 创建车辆副本，用于模拟
+        Vehicle sim_vehicle = *vehicle_template_ptr;
+        // 创建PID控制器副本
+        PID sim_pid = *speed_pid_ptr;
+
+        // 存储预测的x位置
+        vector<double> x_positions;
+        x_positions.reserve(static_cast<size_t>(duration / dt) + 1);
+
+        // 记录初始位置
+        x_positions.push_back(sim_vehicle.x);
+
+        // 模拟加速过程
+        for (double t = 0; t < duration; t += dt) {
+            // 计算加速度
+            double a = sim_pid.compute(target_speed, sim_vehicle.vx, dt);
+            // 更新车辆状态 - 只更新纵向运动
+            sim_vehicle.updateLongitudinal(a, dt);
+            
+            // 记录位置
+            x_positions.push_back(sim_vehicle.x);
+
+        }
+
+        return x_positions;
+    }
+
+    /**
+     * 根据索引获取参考点
+     * @param index 轨迹点索引
+     * @return 对应索引的参考点
+     */
     const ReferencePoint& getPointAtIndex(size_t index) const {
         // 边界检查
         if (index >= trajectory.size()) {
@@ -379,54 +415,62 @@ public:
     }
 
     /**
-     * 生成平滑的S型周期轨迹
-     * @param speed 基准速度
+     * 生成考虑加速过程的平滑S型轨迹
+     * @param target_speed 目标速度
      * @param duration 轨迹持续时间
      * @param dt 时间步长
      * @return 是否成功生成轨迹
      */
-    bool generateTrajectory(double speed, double duration, double dt = 0.01) {
+    bool generateTrajectory(double target_speed, double duration, double dt = 0.01) {
         // 清空旧轨迹
         trajectory.clear();
 
         // 检查参数有效性
-        if (speed <= 0 || duration <= 0 || dt <= 0) {
+        if (target_speed <= 0 || duration <= 0 || dt <= 0) {
             std::cerr << "轨迹生成参数无效" << std::endl;
             return false;
         }
 
-        // 基于曲率和最大横向加速度约束计算安全速度和偏移量
-        // 初步估计最大曲率 - 使用正弦函数，最大曲率出现在波峰和波谷
+        // 模拟车辆加速过程，得到预测的x位置序列
+        vector<double> x_positions = simulateAcceleration(target_speed, duration, dt);
+
+        if (x_positions.empty()) {
+            std::cerr << "加速模拟失败" << std::endl;
+            return false;
+        }
+
+        // 基于曲率和最大横向加速度约束计算安全偏移量
         double estimated_max_curvature = max_lateral_offset * pow(2 * M_PI / path_period, 2);
-
-        // 计算安全的最大速度
-        double max_safe_speed = sqrt(max_lateral_accel / estimated_max_curvature);
-
-        // 如果给定速度超过安全速度，调整速度
         double actual_offset = max_lateral_offset;
-        double actual_speed = speed;
 
-        if (speed > max_safe_speed) {
-            // 降低速度而不是减小偏移量
-            actual_speed = max_safe_speed * 0.9;  // 留10%的安全余量
-            std::cout << "警告: 速度过高可能导致横向加速度超限，已调整速度为 "
-                << actual_speed << "m/s (原始值: " << speed << "m/s)" << std::endl;
+        // 检查偏移量是否满足曲率约束
+        double max_safe_curvature = max_lateral_accel / (target_speed * target_speed);
+        if (estimated_max_curvature > max_safe_curvature) {
+            actual_offset = max_safe_curvature / pow(2 * M_PI / path_period, 2);
+            std::cout << "警告: 横向偏移过大，已调整为 " << actual_offset
+                << "m (原始值: " << max_lateral_offset << "m)" << std::endl;
         }
 
-        // 检查转向角速率约束
-        double max_kappa_rate = max_steering_rate / (vehicle_wheelbase * actual_speed);
-        double required_kappa_rate = 2 * M_PI * actual_speed * actual_offset / (path_period * path_period);
+        // 创建车辆副本用于模拟
+        Vehicle sim_vehicle = *vehicle_template_ptr;
+        PID sim_pid = *speed_pid_ptr;
 
-        if (required_kappa_rate > max_kappa_rate) {
-            // 如果预计超出转向角速率约束，可以再次调整速度或者增加周期长度
-            double adjusted_period = path_period * sqrt(required_kappa_rate / max_kappa_rate);
-            std::cout << "警告: 转向角速率约束可能超限，建议增加轨迹周期至 "
-                << adjusted_period << "m (当前: " << path_period << "m)" << std::endl;
-        }
+        // 生成轨迹点
+        double time = 0.0;
+        for (size_t i = 0; i < x_positions.size(); ++i) {
+            double x = x_positions[i];
 
-        // 生成轨迹点，使用正弦函数生成S形轨迹 - 与Python代码保持一致
-        for (double t = 0; t <= duration; t += dt) {
-            double x = actual_speed * t;
+            // 计算当前点的实际速度（通过模拟）
+            double speed;
+            if (i == 0) {
+                speed = sim_vehicle.vx;
+            }
+            else {
+                // 模拟一步
+                double a = sim_pid.compute(target_speed, sim_vehicle.vx, dt);
+                sim_vehicle.updateLongitudinal(a, dt);
+                speed = sim_vehicle.vx;
+            }
 
             // 计算归一化阶段 (0 到 2π)
             double phase = 2 * M_PI * x / path_period;
@@ -441,19 +485,21 @@ public:
             // 计算曲率 (kappa) - 二阶导数
             double d2y_dx2 = -actual_offset * pow(2 * M_PI / path_period, 2) * sin(phase);
             double kappa = d2y_dx2 / pow(1 + dy_dx * dy_dx, 1.5);
-
             // 存储轨迹点
             trajectory.push_back({
-                t,          // 时间
-                x,          // x位置
-                y,          // y位置
-                psi,        // 航向角
-                actual_speed, // 速度
-                kappa       // 曲率
+                time,        // 时间
+                x,           // x位置
+                y,           // y位置
+                psi,         // 航向角
+                speed,       // 速度 - 使用模拟的速度
+                kappa        // 曲率
                 });
+
+            // 更新时间
+            time += dt;
         }
 
-        // 验证轨迹满足动力学约束
+        // 验证轨迹
         validateTrajectory();
 
         trajectory_generated = true;

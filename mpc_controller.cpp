@@ -7,10 +7,6 @@
  * 改进的模型预测控制器（MPC）
  * 针对直接访问轨迹生成器的版本
  */
- /**
-  * 改进的模型预测控制器（MPC）
-  * 针对直接访问轨迹生成器的版本
-  */
 class ModelPredictiveController {
 private:
     // MPC参数

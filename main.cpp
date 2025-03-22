@@ -12,49 +12,60 @@
 int main() {
     // 初始化车辆
     Vehicle vehicle;
+    vehicle.vx = 0.0; // 初始速度设为0
 
-    // 初始化增强型轨迹生成器
-    ReferenceTrajectoryGenerator trajectory_generator(
-        0.0,    // 最大横向偏移
-        200.0,  // 轨迹周期长度
-        5.0,    // 平滑度因子
-        2.5,    // 轴距
-        2.0,    // 最大横向加速度
-        0.5,    // 最大转向角
-        0.1     // 最大转向角速率
-    );
-
-    // 生成离线轨迹
-    double sim_time = 20.0;  // 模拟时间（秒）
-    double base_speed = 5.0; // 基准速度（m/s）
-    double dt_traj = 0.01;   // 轨迹生成时间步长
-
-    // 生成轨迹并保存
-    trajectory_generator.generateTrajectory(base_speed, sim_time, dt_traj);
-    trajectory_generator.saveTrajectoryToFile("generated_trajectory.csv");
-
-    // 初始化MPC控制器 - 减少预测步数以提高性能
-    ModelPredictiveController mpc(
-        10,     // 预测步数 - 从30减少到15
-        0.05    // 预测步长
-    );
-
-    // 调整MPC控制器权重以提高跟踪性能
-    mpc.setWeights(
-        2000.0,  // 位置误差权重 - 增加
-        5000.0,  // 航向角误差权重 - 增加
-        50.0,    // 横向速度误差权重
-        30.0,    // 横摆角速度误差权重
-        0.1,     // 转向角输入权重
-        0.2      // 转向角变化率权重
-    );
+    const double DT_BASE = 0.01;           // 基础时间步长(秒)
+    const double DT_CONTROL = DT_BASE;     // 控制更新步长
+    const double DT_TRAJ = DT_BASE;        // 轨迹生成步长
+    const double DT_MPC = DT_BASE;         // MPC预测步长也设为0.01秒
+    const int MPC_HORIZON = 5;
 
     // 初始化PID控制器（纵向速度控制）
-    PID speed_pid(20, 0.02, 0.02, -2.0, 2.0);
+    PID speed_pid(20.0, 0.05, 0.02, -2.0, 2.0);
+
+    // 初始化增强型轨迹生成器 - 传入PID和车辆对象
+    ReferenceTrajectoryGenerator trajectory_generator(
+        speed_pid,      // 速度PID控制器
+        vehicle,        // 车辆模板
+        1.0,            // 最大横向偏移
+        200.0,          // 轨迹周期长度
+        5.0,            // 平滑度因子
+        2.5,            // 轴距
+        2.0,            // 最大横向加速度
+        0.5,            // 最大转向角
+        0.1             // 最大转向角速率
+    );
+
+    // 生成离线轨迹 - 现在会考虑加速过程
+    double sim_time = 20.0;  // 模拟时间（秒）
+    double base_speed = 5.0; // 目标速度（m/s）
+    double dt_traj = DT_BASE;   // 轨迹生成时间步长
+    
+
+    // 生成轨迹并保存
+    trajectory_generator.generateTrajectory(base_speed, sim_time + 20.0, dt_traj);
+    trajectory_generator.saveTrajectoryToFile("generated_trajectory.csv");
+
+    // 初始化MPC控制器
+    ModelPredictiveController mpc(
+        MPC_HORIZON,     // 预测步数
+        DT_MPC    // 预测步长
+    );
+
+    // 增强MPC控制器的权重
+    mpc.setWeights(
+        0.0,   // 位置误差权重
+        0.0,   // 航向角误差权重
+        0.0,     // 横向速度误差权重
+        0.0,      // 横摆角速度误差权重
+        50.0,       // 转向角输入权重
+        50.0        // 转向角变化率权重
+    );
+
 
 
     // 仿真参数
-    double dt = 0.01;         // 时间步长
+    double dt = DT_BASE;         // 时间步长
     int steps = static_cast<int>(sim_time / dt);
 
     // 参考速度
@@ -79,14 +90,13 @@ int main() {
     // 上一步的转向角输入
     double prev_delta_f = 0.0;
 
-    // 主循环前，初始化车辆位置到轨迹起点
-    if (!trajectory_generator.trajectory.empty()) {
-        const auto& start_point = trajectory_generator.getPointAtIndex(0);
-        vehicle.x = start_point.x;
-        vehicle.y = start_point.y;
-        vehicle.psi = start_point.psi;
-        vehicle.vx = base_speed * 0.0; // 初始速度设为目标速度的一半
-    }
+    // 重置车辆状态，准备实际仿真
+    vehicle.x = 0.0;
+    vehicle.y = 0.0;
+    vehicle.psi = 0.0;
+    vehicle.vx = 0.0;
+    vehicle.vy = 0.0;
+    vehicle.r = 0.0;
 
     std::cout << "开始仿真..." << std::endl;
 
@@ -113,7 +123,7 @@ int main() {
         while (heading_error > M_PI) heading_error -= 2 * M_PI;
         while (heading_error < -M_PI) heading_error += 2 * M_PI;
 
-        double speed_error = vehicle.vx - target_speed;
+        double speed_error = vehicle.vx - speed_ref;
 
         // 更新误差统计
         total_lateral_error += std::abs(lateral_error);
@@ -127,17 +137,8 @@ int main() {
         double mpc_delta_f = mpc.compute(vehicle, trajectory_generator, prev_delta_f, trajectory_index);
 
 
-
-        // 计算控制输入
-        double max_speed_reduction = 2.0;  // 最大速度降低 2 m/s
-        double error_threshold = 0.1;      // 横向误差阈值
-
-        // 基于横向误差动态调整目标速度
-        double speed_reduction = std::min(max_speed_reduction, std::abs(lateral_error) / error_threshold);
-        double adjusted_target_speed = target_speed - speed_reduction;
-
-        // 纵向控制：使用PID计算加速度
-        double a = speed_pid.compute(adjusted_target_speed, vehicle.vx, dt);
+        // 纵向控制：使用PID计算加速度，参考速度现在使用轨迹点中的速度
+        double a = speed_pid.compute(speed_ref, vehicle.vx, dt);
 
         // 更新车辆状态
         vehicle.updateLongitudinal(a, dt);
@@ -155,14 +156,13 @@ int main() {
             << vehicle.psi << ","
             << y_ref << ","
             << psi_ref << ","
-            << target_speed << ","
+            << speed_ref << ","
             << lateral_error << ","
             << heading_error << ","
             << speed_error << ","
             << mpc_delta_f << ","
             << a << std::endl;
 
-        // 每秒输出一次状态
         if (i % 100 == 0) {
             std::cout << "Time: " << std::fixed << std::setprecision(1) << t
                 << "s, y: " << std::setprecision(2) << vehicle.y
@@ -172,14 +172,21 @@ int main() {
                 << "rad, v: " << vehicle.vx << "m/s" << std::endl;
         }
 
-        // 更新轨迹索引，根据实际速度和轨迹点间距确定增量
-        // 这里假设等间距轨迹点，且以dt_traj为时间间隔生成
-        double distance_traveled = vehicle.vx * dt;
-        double distance_per_point = base_speed * dt_traj; // 轨迹点之间的距离
-        int index_increment = static_cast<int>(std::round(distance_traveled / distance_per_point));
+        // 根据x位置寻找下一个合适的轨迹点
+        double min_dist = std::numeric_limits<double>::max();
+        size_t closest_idx = trajectory_index;
 
-        // 确保至少前进一个点
-        trajectory_index += std::max(1, index_increment);
+        // 在未来一小段轨迹中查找最接近的点
+        for (size_t j = trajectory_index; j < std::min(trajectory_index + 50, trajectory_generator.trajectory.size()); ++j) {
+            double dist = std::abs(trajectory_generator.trajectory[j].x - vehicle.x);
+            if (dist < min_dist) {
+                min_dist = dist;
+                closest_idx = j;
+            }
+        }
+
+        // 更新轨迹索引
+        trajectory_index = closest_idx + 1; // 前进到下一个点
     }
 
     // 计算并输出统计指标
